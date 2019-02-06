@@ -1,22 +1,28 @@
+from abc import abstractmethod
 from collections import defaultdict
 
-from quantdsl.domain.model.call_dependencies import  CallDependenciesRepository, register_call_dependencies
+import six.moves.queue as queue
+
+from quantdsl.domain.model.call_dependencies import CallDependenciesRepository, register_call_dependencies
 from quantdsl.domain.model.call_dependents import CallDependentsRepository, register_call_dependents
 from quantdsl.domain.model.call_leafs import register_call_leafs
 from quantdsl.domain.model.call_link import register_call_link
-from quantdsl.domain.model.call_requirement import register_call_requirement
+from quantdsl.domain.model.call_requirement import StubbedCall, register_call_requirement
 from quantdsl.domain.model.contract_specification import ContractSpecification
 from quantdsl.domain.services.parser import dsl_parse
-from quantdsl.semantics import Module, DslNamespace, extract_defs_and_exprs, DslExpression, generate_stubbed_calls
+from quantdsl.exceptions import DslSyntaxError
+from quantdsl.semantics import DslExpression, DslNamespace, FunctionDef, Module, PendingCall, Stub
 
 
-def generate_dependency_graph(contract_specification, call_dependencies_repo, call_dependents_repo, call_leafs_repo,
-                              call_requirement_repo):
-
+def generate_dependency_graph(contract_specification, call_dependencies_repo, call_dependents_repo,
+                              call_requirement_repo, dsl_classes=None):
     assert isinstance(contract_specification, ContractSpecification)
-    dsl_module = dsl_parse(dsl_source=contract_specification.specification)
+    dsl_module = dsl_parse(
+        dsl_source=contract_specification.source_code,
+        dsl_classes=dsl_classes,
+    )
     assert isinstance(dsl_module, Module)
-    dsl_globals = DslNamespace()
+    dsl_globals = dsl_module.namespace.copy()
     function_defs, expressions = extract_defs_and_exprs(dsl_module, dsl_globals)
     dsl_expr = expressions[0]
     assert isinstance(dsl_expr, DslExpression)
@@ -26,23 +32,33 @@ def generate_dependency_graph(contract_specification, call_dependencies_repo, ca
     all_dependents = defaultdict(list)
 
     # Generate stubbed call from the parsed DSL module object.
-    for stub in generate_stubbed_calls(contract_specification.id, dsl_module, dsl_expr, dsl_globals, dsl_locals):
+    for stubed_call in generate_stubbed_calls(contract_specification.id, dsl_expr, dsl_globals, dsl_locals,
+                                              contract_specification.observation_date):
         # assert isinstance(stub, StubbedCall)
 
-        # Register the call requirements.
-        call_id = stub.call_id
-        dsl_source = str(stub.dsl_expr)
-        effective_present_time = stub.effective_present_time
-        call_requirement = register_call_requirement(call_id, dsl_source, effective_present_time)
+        # Estimate the cost of evaluating this expression.
+        estimated_cost = stubed_call.dsl_expr.cost_expression()
 
-        # Hold onto the dsl_expr, helps in "single process" modes....
-        call_requirement._dsl_expr = stub.dsl_expr
-        # - put the entity directly in the cache, otherwise the entity will be regenerated when it is next accessed
-        #   and the _dsl_expr will be lost.
+        # Register the call requirements.
+        call_id = stubed_call.call_id
+        dsl_source = str(stubed_call.dsl_expr)
+        present_time = stubed_call.present_time
+        call_requirement = register_call_requirement(
+            call_id=call_id,
+            dsl_source=dsl_source,
+            present_time=present_time,
+            contract_specification_id=contract_specification.id,
+            cost=estimated_cost,
+        )
+
+        # Hold onto the dsl_expr, helps in "single process" modes.
+        # - put the entity directly in the cache, otherwise the entity will be
+        # regenerated when it is next accessed and the _dsl_expr will be "lost"
+        call_requirement._dsl_expr = stubed_call.dsl_expr
         call_requirement_repo.add_cache(call_id, call_requirement)
 
-        # Register the call requirements.
-        dependencies = stub.requirements
+        # Register the call dependencies (things needed by this call).
+        dependencies = stubed_call.requirements
         register_call_dependencies(call_id, dependencies)
 
         # Keep track of the leaves and the dependents.
@@ -74,7 +90,6 @@ def generate_execution_order(leaf_call_ids, call_dependents_repo, call_dependenc
     assert isinstance(call_dependents_repo, CallDependentsRepository)
     assert isinstance(call_dependencies_repo, CallDependenciesRepository)
 
-
     # Initialise set of nodes that have no outstanding requirements with the leaf nodes.
     S = set(leaf_call_ids)
     removed_edges = defaultdict(set)
@@ -86,11 +101,8 @@ def generate_execution_order(leaf_call_ids, call_dependents_repo, call_dependenc
         # Yield node n.
         yield n
 
-        # Get dependents, if any were registered.
-        try:
-            dependents = call_dependents_repo[n]
-        except KeyError:
-            continue
+        # Get dependents (calls waiting for this call).
+        dependents = call_dependents_repo[n]
 
         # Visit the nodes that are dependent on n.
         for m in dependents:
@@ -110,6 +122,128 @@ def generate_execution_order(leaf_call_ids, call_dependents_repo, call_dependenc
                 # Add m to the set of nodes that have zero outstanding requirements.
                 S.add(m)
 
-    # Todo: Restore the check for remaining (unremoved) edges. Hard to do from the domain model,
-    # so perhaps get all nodes in memory and actually remove them from a
-    # collection so that we can see if anything remains unremoved (indicates cyclical dependencies).
+                # Todo: Restore the check for remaining (unremoved) edges. Hard to do from the domain model,
+                # so perhaps get all nodes in memory and actually remove them from a
+                # collection so that we can see if anything remains unremoved (indicates cyclical dependencies).
+
+
+def generate_stubbed_calls(root_stub_id, dsl_expr, dsl_globals, dsl_locals, observation_date):
+    # Create a stack of discovered calls to function defs.
+    # - since we are basically doing a breadth-first search, the pending call queue
+    #   will be the max width of the graph, so it might sometimes be useful to
+    #   persist the queue to allow for larger graph. For now, just use a Python queue.
+    pending_call_stack = PythonPendingCallQueue()
+
+    # Reduce the module object into a "root" stubbed expression with pending calls on the stack.
+    # - If an expression has a FunctionCall, it will cause a pending
+    # call to be placed on the pending call stack, and the function call will be
+    # replaced with a stub, which acts as a placeholder for the result of the function
+    # call. By looping over the pending call stack until it is empty, evaluating
+    # pending calls to generate stubbed expressions and further pending calls, the
+    # module can be compiled into a stack of stubbed expressions.
+    # Of course if the module's expression doesn't have a function call, there
+    # will just be one expression on the stack of "stubbed" expressions, and it will
+    # not have any stubs, and there will be no pending calls on the pending call stack.
+
+    # Substitute the Name elements, e.g. so function calls have function defs.
+    dsl_expr = dsl_expr.substitute_names(dsl_globals.combine(dsl_locals))
+
+    # Call functions (causes FunctionCall elements to be substituted
+    # with Stub elements, and pending calls to be put on the stack).
+    stubbed_expr = dsl_expr.call_functions(
+        pending_call_stack=pending_call_stack,
+        present_time=observation_date,
+        observation_date=observation_date,
+    )
+
+    # Find all the Stub elemements in the expression.
+    dependencies = list_stub_dependencies(stubbed_expr)
+
+    # Yield a stubbed call (becomes a dependency graph node).
+    yield StubbedCall(root_stub_id, stubbed_expr, observation_date, dependencies)
+
+    # Continue by looping over any pending calls.
+    while not pending_call_stack.empty():
+        # Get the next pending call.
+        pending_call = pending_call_stack.get()
+        # assert isinstance(pending_call, PendingCall), pending_call
+
+        # Get the function def.
+        function_def = pending_call.stacked_function_def
+        assert isinstance(function_def, FunctionDef), type(function_def)
+
+        # Apply the stacked call values to the called function def.
+        stacked_locals = dsl_locals.combine(pending_call.stacked_locals)
+        stubbed_expr = function_def.apply(
+            present_time=pending_call.present_time,
+            observation_date=observation_date,
+            pending_call_stack=pending_call_stack,
+            # Make sure calling this pending call doesn't result
+            # in just a pending call being added to the stack.
+            is_destacking=True,
+            **stacked_locals)
+
+        # Put the resulting (potentially stubbed) expression on the stack of stubbed expressions.
+        dependencies = list_stub_dependencies(stubbed_expr)
+
+        yield StubbedCall(pending_call.stub_id, stubbed_expr, pending_call.present_time, dependencies)
+
+
+def list_stub_dependencies(stubbed_expr):
+    return [s.name for s in stubbed_expr.list_instances(Stub)]
+
+
+def extract_defs_and_exprs(dsl_module, dsl_globals):
+    # Pick out the expressions and function defs from the module body.
+    function_defs = []
+    expressions = []
+    for dsl_obj in dsl_module.body:
+
+        if isinstance(dsl_obj, FunctionDef):
+            function_defs.append(dsl_obj)
+        elif isinstance(dsl_obj, DslExpression):
+            expressions.append(dsl_obj)
+        else:
+            raise DslSyntaxError("'%s' not allowed in module" % type(dsl_obj), dsl_obj, node=dsl_obj.node)
+
+    return function_defs, expressions
+
+
+class PendingCallQueue(object):
+    def put(self, stub_id, stacked_function_def, stacked_locals, present_time):
+        pending_call = self.validate_pending_call(present_time, stacked_function_def, stacked_locals, stub_id)
+        self.put_pending_call(pending_call)
+
+    def validate_pending_call(self, present_time, stacked_function_def, stacked_locals, stub_id):
+        # assert isinstance(stub_id, six.string_types), type(stub_id)
+        # assert isinstance(stacked_function_def, FunctionDef), type(stacked_function_def)
+        # assert isinstance(stacked_locals, DslNamespace), type(stacked_locals)
+        # assert isinstance(stacked_globals, DslNamespace), type(stacked_globals)
+        # assert isinstance(present_time, (datetime.datetime, type(None))), type(present_time)
+        return PendingCall(stub_id, stacked_function_def, stacked_locals, present_time)
+
+    @abstractmethod
+    def put_pending_call(self, pending_call):
+        """
+        Puts pending call on the queue.
+        """
+
+    @abstractmethod
+    def get(self):
+        """
+        Gets pending call from the queue.
+        """
+
+
+class PythonPendingCallQueue(PendingCallQueue):
+    def __init__(self):
+        self.queue = queue.Queue()
+
+    def put_pending_call(self, pending_call):
+        self.queue.put(pending_call)
+
+    def empty(self):
+        return self.queue.empty()
+
+    def get(self, *args, **kwargs):
+        return self.queue.get(*args, **kwargs)

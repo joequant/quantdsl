@@ -11,25 +11,39 @@ class ContractValuation(EventSourcedEntity):
     class Discarded(EventSourcedEntity.Discarded):
         pass
 
-    def __init__(self, market_simulation_id, dependency_graph_id, **kwargs):
+    def __init__(self, market_simulation_id, contract_specification_id, periodisation, is_double_sided_deltas,
+                 **kwargs):
         super(ContractValuation, self).__init__(**kwargs)
         self._market_simulation_id = market_simulation_id
-        self._dependency_graph_id = dependency_graph_id
+        self._contract_specification_id = contract_specification_id
+        self._periodisation = periodisation
+        self._is_double_sided_deltas = is_double_sided_deltas
 
     @property
     def market_simulation_id(self):
         return self._market_simulation_id
 
     @property
-    def dependency_graph_id(self):
-        return self._dependency_graph_id
+    def contract_specification_id(self):
+        return self._contract_specification_id
+
+    @property
+    def periodisation(self):
+        return self._periodisation
+
+    @property
+    def is_double_sided_deltas(self):
+        return self._is_double_sided_deltas
 
 
-def start_contract_valuation(entity_id, dependency_graph_id, market_simulation_id):
+def start_contract_valuation(contract_specification_id, market_simulation_id, periodisation, is_double_sided_deltas):
+    contract_valuation_id = create_contract_valuation_id()
     contract_valuation_created = ContractValuation.Created(
-        entity_id=entity_id,
+        entity_id=contract_valuation_id,
         market_simulation_id=market_simulation_id,
-        dependency_graph_id=dependency_graph_id,
+        contract_specification_id=contract_specification_id,
+        periodisation=periodisation,
+        is_double_sided_deltas=is_double_sided_deltas,
     )
     contract_valuation = ContractValuation.mutator(event=contract_valuation_created)
     publish(contract_valuation_created)

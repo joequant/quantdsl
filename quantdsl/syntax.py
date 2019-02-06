@@ -1,20 +1,53 @@
 import ast
+
 import six
 
 from quantdsl.exceptions import DslSyntaxError
+from quantdsl.semantics import FunctionDef, DslNamespace
+
+if six.PY2:
+    from importlib import import_module
+elif six.PY3:
+    find_spec = None
+    find_loader = None
+    try:
+        from importlib.util import find_spec
+    except:
+        from importlib.util import find_loader
+
+
+def find_module_path(name):
+    # Find path.
+
+    if six.PY2:
+        try:
+            module = import_module(name)
+        except SyntaxError as e:
+            raise DslSyntaxError("Can't import {}: {}".format(name, e))
+        path = module.__file__.strip('c')
+    elif six.PY3:
+        if find_loader:
+            loader = find_loader(name)
+            path = loader.path
+        else:
+            spec = find_spec(name)
+            path = spec.origin
+
+    assert path.endswith('.py'), path
+    return path
 
 
 class DslParser(object):
 
-    def parse(self, dsl_source, filename='<unknown>', dsl_classes=None):
+    def __init__(self, dsl_classes=None):
+        if dsl_classes is None:
+            dsl_classes = {}
+        self.dsl_classes = dsl_classes
+
+    def parse(self, dsl_source, filename='<unknown>'):
         """
         Creates a DSL Module object from a DSL source text.
         """
-        self.dsl_classes = {}
-        if dsl_classes:
-            # assert isinstance(dsl_classes, dict)
-            self.dsl_classes.update(dsl_classes)
-
         if not isinstance(dsl_source, six.string_types):
             raise DslSyntaxError("Can't dsl_parse non-string object", dsl_source)
 
@@ -23,7 +56,7 @@ class DslParser(object):
             # Parse as Python source code, into a Python abstract syntax tree.
             ast_module = ast.parse(dsl_source, filename=filename, mode='exec')
         except SyntaxError as e:
-            raise DslSyntaxError("DSL source code is not valid Python code", e)
+            raise DslSyntaxError("DSL source code is not valid Python code: {}".format(dsl_source), e)
 
         # Generate Quant DSL from Python AST.
         return self.visitAstNode(ast_module)
@@ -58,8 +91,56 @@ class DslParser(object):
         Returns a DSL Module, with a list of DSL expressions as the body.
         """
         # assert isinstance(node, ast.Module)
-        body = [self.visitAstNode(n) for n in node.body]
-        return self.dsl_classes['Module'](body, node=node)
+        body = []
+
+        # Namespace for function defs in module.
+        module_namespace = DslNamespace()
+
+        for n in node.body:
+            dsl_object = self.visitAstNode(n)
+
+            # Put function defs in module namespace.
+            if isinstance(dsl_object, FunctionDef):
+                module_namespace[dsl_object.name] = dsl_object
+
+                # Share module namespace with this function.
+                if dsl_object.module_namespace is None:
+                    dsl_object.module_namespace = module_namespace
+
+            # Include imported things.
+            if isinstance(dsl_object, list):
+                for _dsl_object in dsl_object:
+                    if isinstance(_dsl_object, FunctionDef):
+                        module_namespace[_dsl_object.name] = _dsl_object
+            else:
+                body.append(dsl_object)
+
+        return self.dsl_classes['Module'](body, module_namespace, node=node)
+
+    def visitImportFrom(self, node):
+        """
+        Visitor method for ast.ImportFrom nodes.
+
+        Returns the result of visiting the expression held by the return statement.
+        """
+        assert isinstance(node, ast.ImportFrom)
+        if node.module == 'quantdsl.semantics':
+            return []
+        from_names = [a.name for a in node.names]
+        dsl_module = self.import_dsl_module(node.module)
+        nodes = []
+        for node in dsl_module.body:
+            if isinstance(node, FunctionDef) and node.name in from_names:
+                nodes.append(node)
+        return nodes
+
+    def import_dsl_module(self, name):
+        path = find_module_path(name)
+        with open(path) as f:
+            source = f.read()
+        dsl_module = self.parse(source, filename=path)
+        assert isinstance(dsl_module, self.dsl_classes['Module']), type(dsl_module)
+        return dsl_module
 
     def visitReturn(self, node):
         """
@@ -77,10 +158,8 @@ class DslParser(object):
         Returns the result of visiting the contents of the expression node.
         """
         # assert isinstance(node, ast.Expr)
-        if isinstance(node.value, ast.AST):
-            return self.visitAstNode(node.value)
-        else:
-            raise DslSyntaxError
+        assert isinstance(node.value, ast.AST), type(node.value)
+        return self.visitAstNode(node.value)
 
     def visitNum(self, node):
         """
@@ -148,14 +227,10 @@ class DslParser(object):
             ast.And: self.dsl_classes['And'],
             ast.Or: self.dsl_classes['Or'],
         }
-        try:
-            dsl_class = type_map[type(node.op)]
-        except KeyError:
-            raise DslSyntaxError("Unsupported boolean operator token: %s" % node.op)
-        else:
-            values = [self.visitAstNode(v) for v in node.values]
-            args = [values]
-            return dsl_class(node=node, *args)
+        dsl_class = type_map[type(node.op)]
+        values = [self.visitAstNode(v) for v in node.values]
+        args = [values]
+        return dsl_class(node=node, *args)
 
     def visitName(self, node):
         """
@@ -174,9 +249,9 @@ class DslParser(object):
         """
         if node.keywords:
             raise DslSyntaxError("Calling with keywords is not currently supported (positional args only).")
-        if node.starargs:
+        if hasattr(node, 'starargs') and node.starargs:
             raise DslSyntaxError("Calling with starargs is not currently supported (positional args only).")
-        if node.kwargs:
+        if hasattr(node, 'kwargs') and node.kwargs:
             raise DslSyntaxError("Calling with kwargs is not currently supported (positional args only).")
 
         # Collect the call arg expressions (whose values will be passed into the call when it is made).
@@ -243,10 +318,9 @@ class DslParser(object):
         conditional upon the test.
         """
         test = self.visitAstNode(node.test)
-        assert len(node.body) == 1, "If statements with more than one body statement are not supported at the moment."
+        assert len(node.body) == 1, "If statement body must have exactly one statement"
         body = self.visitAstNode(node.body[0])
-        assert len(
-            node.orelse) == 1, "If statements with more than one orelse statement are not supported at the moment."
+        assert len(node.orelse) == 1, "If statement must have exactly one orelse statement"
         orelse = self.visitAstNode(node.orelse[0])
         args = [test, body, orelse]
         return self.dsl_classes['If'](node=node, *args)

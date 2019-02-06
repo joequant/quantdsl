@@ -11,17 +11,26 @@ class ContractSpecification(EventSourcedEntity):
     class Discarded(EventSourcedEntity.Discarded):
         pass
 
-    def __init__(self, specification, **kwargs):
+    def __init__(self, source_code, observation_date, **kwargs):
         super(ContractSpecification, self).__init__(**kwargs)
-        self._specification = specification
+        self._source_code = source_code
+        self._observation_date = observation_date
 
     @property
-    def specification(self):
-        return self._specification
+    def source_code(self):
+        return self._source_code
+
+    @property
+    def observation_date(self):
+        return self._observation_date
 
 
-def register_contract_specification(specification):
-    created_event = ContractSpecification.Created(entity_id=create_uuid4(), specification=specification)
+def register_contract_specification(source_code, observation_date=None):
+    created_event = ContractSpecification.Created(
+        entity_id=create_uuid4(),
+        source_code=source_code,
+        observation_date=observation_date,
+    )
     contract_specification = ContractSpecification.mutator(event=created_event)
     publish(created_event)
     return contract_specification
